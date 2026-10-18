@@ -5,6 +5,9 @@ let serverBase='',serverToken='',connected=false,connecting=false,rec=null,recor
 const memoryQueue=new Map();
 let pairing;
 try{serverToken=sessionStorage.getItem('voice-session')||'';}catch{}
+// A Safari/Home Screen session may block or isolate cookies and browser storage.
+const linkCode=location.pathname.match(/^\/connect\/([^/]+)(?:\/|$)/)?.[1];
+if(linkCode)serverToken=linkCode;
 try { const value=new URLSearchParams(location.hash.slice(1)).get('pair'); if(value) pairing=JSON.parse(value); } catch {}
 function notice(message,persistent=false){$('notice').textContent=message;$('notice').hidden=false;clearTimeout(notice.timeout);if(!persistent)notice.timeout=setTimeout(()=>$('notice').hidden=true,6000);}
 function safeAction(fn){return async event=>{try{await fn(event);}catch(e){notice(e.message);}};}
