@@ -22,7 +22,7 @@ async function request(path,options={}){
 async function api(path,body){const response=await request(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok){if(response.status===401)showConnection(false);const error=new Error(data.error||'처리를 완료하지 못했습니다.');error.status=response.status;throw error;}return data;}
 function renderAnalysis(analysis){
   const panel=$('analysisPanel');if(!panel)return;
-  if(!analysis||(analysisSession&&analysis.session!==analysisSession)){panel.hidden=true;return;}
+  if(!analysis||(analysisSession&&analysis.session!==analysisSession)||rec||recordingStarting||(uploadMeter.total&&uploadMeter.confirmed<uploadMeter.total)){panel.hidden=true;return;}
   panel.hidden=false;$('analysisText').textContent=analysis.text;
   $('analysisTip').textContent=analysis.tip||'';$('analysisTip').hidden=!analysis.tip;
 }
