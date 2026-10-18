@@ -2,7 +2,9 @@
 const $=id=>document.getElementById(id);
 const hosted=location.hostname.endsWith('.github.io');
 let serverBase='',serverToken='',connected=false,connecting=false,rec=null,recordingStarting=false,queueDB,syncing=false,currentJob=null;
+const memoryQueue=new Map();
 let pairing;
+try{serverToken=sessionStorage.getItem('voice-session')||'';}catch{}
 try { const value=new URLSearchParams(location.hash.slice(1)).get('pair'); if(value) pairing=JSON.parse(value); } catch {}
 function notice(message,persistent=false){$('notice').textContent=message;$('notice').hidden=false;clearTimeout(notice.timeout);if(!persistent)notice.timeout=setTimeout(()=>$('notice').hidden=true,6000);}
 function safeAction(fn){return async event=>{try{await fn(event);}catch(e){notice(e.message);}};}
@@ -18,7 +20,7 @@ async function refresh(){const data=await api('/api/status');showConnection(true
 async function connect(){
   if(connecting)return;connecting=true;
   try{
-    if(pairing?.code){await api('/api/login',{code:pairing.code});pairing=null;history.replaceState(null,'',location.pathname+location.search);}
+    if(pairing?.code){const code=pairing.code;await api('/api/login',{code});serverToken=code;try{sessionStorage.setItem('voice-session',code);}catch{}pairing=null;history.replaceState(null,'',location.pathname+location.search);}
     await refresh();await syncQueue();
   }catch(e){$('connectionText').textContent=e.status===401?'개인 연결 링크로 열어주세요.':'맥북 연결 대기';}
   finally{connecting=false;}
@@ -36,10 +38,35 @@ function queueTransaction(mode, action) {
     transaction.oncomplete = () => resolve(request.result); transaction.onerror = () => reject(transaction.error); transaction.onabort = () => reject(transaction.error);
   });
 }
+async function queuedRows() {
+  let stored=[];
+  if(queueDB)stored=await queueTransaction('readonly',store=>store.getAll());
+  return [...new Map([...stored,...memoryQueue.values()].map(row=>[row.id,row])).values()];
+}
 async function pendingCount() {
-  const count = await queueTransaction('readonly', store => store.count());
-  $('pendingCount').textContent = count ? `기기에 업로드 대기 ${count}개` : '';
+  let count=memoryQueue.size;
+  try{count=(await queuedRows()).length;}catch{}
+  $('pendingCount').textContent=count?`자동 전송 대기 ${count}개`:'';
   return count;
+}
+async function saveChunk(row,current) {
+  // Safari can reject Blob values in IndexedDB. Store transferable WAV bytes instead.
+  try{
+    if(!queueDB)throw new Error('Storage unavailable');
+    await queueTransaction('readwrite',store=>store.put(row));
+  }catch{
+    // Keep this page's bytes for direct upload; never launch a file download.
+    memoryQueue.set(row.id,row);
+    const bytes=[...memoryQueue.values()].reduce((n,item)=>n+(item.audio?.byteLength||item.blob?.size||0),0);
+    if(bytes>=24*1024*1024){
+      current.failed=true;
+      notice('맥북 전송을 기다리며 녹음을 일시 중단합니다. 이 화면을 유지하면 자동으로 재전송합니다.',true);
+      if(!current.stopping)void stopRecording().catch(error=>notice(error.message,true));
+    }
+  }
+  current.saved++;
+  await pendingCount();
+  void syncQueue();
 }
 function encodeWav(samples, rate) {
   const bytes = new ArrayBuffer(44 + samples.length * 2), view = new DataView(bytes);
@@ -52,18 +79,20 @@ function encodeWav(samples, rate) {
   return new Blob([bytes], {type:'audio/wav'});
 }
 async function syncQueue() {
-  if (syncing || !queueDB || !connected) return;
+  if (syncing || !connected) return;
   syncing = true;
   try {
-    const pending = await queueTransaction('readonly', store => store.getAll());
+    let pending;
+    try{pending=await queuedRows();}catch{pending=[...memoryQueue.values()];}
     for (const row of pending) {
-      const response = await request('/api/recordings', {method:'POST', body:row.blob,
+      const response = await request('/api/recordings', {method:'POST', body:row.audio||row.blob,
         headers:{'Content-Type':'audio/wav', 'X-Recording-ID':row.id, 'X-Session-ID':row.session}});
       if (!response.ok) {
         if (response.status === 401) { connected = false; showConnection(false); }
-        throw new Error('녹음이 기기에 보관 중입니다. 맥북 연결 후 다시 업로드해주세요.');
+        throw new Error('녹음을 임시 보관 중입니다. 맥북 연결 후 자동 전송합니다.');
       }
-      await queueTransaction('readwrite', store => store.delete(row.id));
+      if(queueDB)await queueTransaction('readwrite', store => store.delete(row.id));
+      memoryQueue.delete(row.id);
       await pendingCount();
     }
     if (pending.length) await refresh();
@@ -72,7 +101,9 @@ async function syncQueue() {
 async function startRecording() {
   if (rec || recordingStarting) return;
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('마이크는 localhost 또는 HTTPS에서 사용할 수 있습니다. 맥북은 http://localhost:8840로 접속하세요.');
-  if (!queueDB) throw new Error('브라우저 저장소를 사용할 수 없습니다. 저장소 사용을 허용해주세요.');
+  await connect();
+  if(!connected)throw new Error('맥북 연결이 필요합니다. 개인 연결 링크로 열어주세요.');
+  if(memoryQueue.size)throw new Error('이전 녹음을 맥북으로 자동 전송 중입니다. 잠시 후 다시 시작해주세요.');
   recordingStarting = true; $('startRecord').disabled = true;
   let stream, context;
   try {
@@ -85,17 +116,10 @@ async function startRecording() {
     const current = rec;
     node.port.onmessage = ({data}) => {
       if (data.samples) {
-        const blob = encodeWav(data.samples, context.sampleRate), row = {id:crypto.randomUUID(), session, blob};
-        current.saving = current.saving.then(async () => {
-          try { await queueTransaction('readwrite', store => store.put(row)); current.saved++; await pendingCount(); void syncQueue(); }
-          catch (error) {
-            // Retain the failed chunk as a downloadable file if IndexedDB fills up.
-            current.failed = true;
-            const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `recovered-${row.id}.wav`; a.click();
-            setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-            notice('브라우저 저장공간이 부족합니다. 복구 WAV를 다운로드했습니다. 녹음을 중단합니다.', true);
-            if (!current.stopping) void stopRecording();
-          }
+        const blob=encodeWav(data.samples,context.sampleRate);
+        current.saving=current.saving.then(async()=>{
+          const row={id:crypto.randomUUID(),session,audio:await blob.arrayBuffer()};
+          await saveChunk(row,current);
         });
       }
       if (data.stopped) current.stoppedResolve?.();
@@ -130,9 +154,9 @@ async function stopRecording() {
     current.source.disconnect(); current.node.disconnect(); await current.context.close();
     await current.wakeLock?.release(); rec = null;
     $('startRecord').disabled = false; document.body.classList.remove('recording');
-    $('recordState').textContent = current.failed ? '저장 오류 · 복구 파일 확인' : '녹음 종료'; drawLive();
+    $('recordState').textContent = current.failed ? '자동 전송 대기' : '녹음 종료'; drawLive();
   }
-  await syncQueue(); notice('녹음을 저장했습니다.');
+  await syncQueue();notice(await pendingCount()?'맥북 연결 후 자동 전송합니다. 이 화면을 유지해주세요.':'맥북에 녹음을 저장했습니다.');
 }
 function canvasSetup(canvas) {
   const ratio = window.devicePixelRatio || 1, width = canvas.clientWidth, height = canvas.clientHeight;
@@ -186,6 +210,6 @@ setInterval(()=>{if(!hosted)void connect();},10000);
       location.replace(destination.origin+'/'+location.hash);return;
     }catch{$('connectionText').textContent='맥북 연결 준비 중';}
   }
-  try{queueDB=await openQueue();await pendingCount();}catch{$('startRecord').disabled=true;notice('녹음 저장을 위해 브라우저 저장 공간을 허용해주세요.',true);}
+  try{queueDB=await openQueue();await pendingCount();}catch{queueDB=null;}
   drawLive();if(!hosted)await connect();
 })();
