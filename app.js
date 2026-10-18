@@ -67,6 +67,7 @@ async function saveChunk(row,current) {
       if(!current.stopping)void stopRecording().catch(error=>notice(error.message,true));
     }
   }
+  trackUpload(row);uploadMeter.state='uploading';renderUpload();
   current.saved++;
   await pendingCount();
   void syncQueue();
@@ -81,15 +82,58 @@ function encodeWav(samples, rate) {
   for (let i = 0; i < samples.length; i++) { const s = Math.max(-1, Math.min(1, samples[i])); view.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true); }
   return new Blob([bytes], {type:'audio/wav'});
 }
+const uploadMeter={rows:new Map(),total:0,confirmed:0,current:0,state:'idle'};
+function trackUpload(row){
+  if(!uploadMeter.rows.has(row.id)){
+    const bytes=row.audio?.byteLength||row.blob?.size||0;
+    uploadMeter.rows.set(row.id,bytes);uploadMeter.total+=bytes;
+  }
+}
+function renderUpload(){
+  const panel=$('uploadPanel');if(!panel)return;
+  panel.hidden=!uploadMeter.total;
+  if(!uploadMeter.total)return;
+  const complete=uploadMeter.confirmed>=uploadMeter.total;
+  const percent=complete?100:Math.min(99,Math.floor(100*(uploadMeter.confirmed+uploadMeter.current)/uploadMeter.total));
+  $('uploadProgress').value=percent;$('uploadPercent').textContent=percent+'%';
+  const active=rec||recordingStarting;
+  $('uploadText').textContent=complete?(active?'전송 완료 · 녹음 중':'전송 완료 · 맥북에 저장됨'):
+    uploadMeter.state==='confirming'?'맥북 저장 확인 중':uploadMeter.state==='waiting'?'연결 대기 · 자동 재전송':'맥북으로 전송 중';
+  $('uploadHint').textContent=complete?(active?'마지막 녹음은 종료 후 전송됩니다.':'화면을 닫아도 됩니다.'):'전송이 끝날 때까지 이 화면을 유지해주세요.';
+}
+function uploadRecording(row){
+  trackUpload(row);uploadMeter.current=0;uploadMeter.state='uploading';renderUpload();
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();xhr.open('POST',serverBase+'/api/recordings');xhr.timeout=60000;
+    xhr.setRequestHeader('Content-Type','audio/wav');xhr.setRequestHeader('X-Recording-ID',row.id);xhr.setRequestHeader('X-Session-ID',row.session);
+    if(serverToken)xhr.setRequestHeader('Authorization','Bearer '+serverToken);
+    xhr.upload.onprogress=event=>{
+      if(event.lengthComputable){uploadMeter.current=Math.min(uploadMeter.rows.get(row.id),event.loaded);renderUpload();}
+    };
+    xhr.upload.onload=()=>{uploadMeter.state='confirming';renderUpload();};
+    xhr.onload=()=>{
+      uploadMeter.current=0;
+      const ok=xhr.status>=200&&xhr.status<300;
+      if(ok){uploadMeter.confirmed+=uploadMeter.rows.get(row.id);uploadMeter.rows.set(row.id,0);}
+      else uploadMeter.state='waiting';
+      renderUpload();resolve({ok,status:xhr.status});
+    };
+    xhr.onerror=xhr.ontimeout=xhr.onabort=()=>{
+      uploadMeter.current=0;uploadMeter.state='waiting';showConnection(false);renderUpload();
+      reject(new Error('연결 대기 중입니다. 녹음은 자동으로 재전송합니다.'));
+    };
+    xhr.send(row.audio||row.blob);
+  });
+}
 async function syncQueue() {
   if (syncing || !connected) return;
   syncing = true;
   try {
     let pending;
     try{pending=await queuedRows();}catch{pending=[...memoryQueue.values()];}
+    pending.forEach(trackUpload);renderUpload();
     for (const row of pending) {
-      const response = await request('/api/recordings', {method:'POST', body:row.audio||row.blob,
-        headers:{'Content-Type':'audio/wav', 'X-Recording-ID':row.id, 'X-Session-ID':row.session}});
+      const response=await uploadRecording(row);
       if (!response.ok) {
         if (response.status === 401) { connected = false; showConnection(false); }
         throw new Error('녹음을 임시 보관 중입니다. 맥북 연결 후 자동 전송합니다.');
@@ -107,7 +151,8 @@ async function startRecording() {
   await connect();
   if(!connected)throw new Error('맥북 연결이 필요합니다. 개인 연결 링크로 열어주세요.');
   if(memoryQueue.size)throw new Error('이전 녹음을 맥북으로 자동 전송 중입니다. 잠시 후 다시 시작해주세요.');
-  recordingStarting = true; $('startRecord').disabled = true;
+  if(!(await pendingCount())){uploadMeter.rows.clear();uploadMeter.total=0;uploadMeter.confirmed=0;uploadMeter.current=0;}
+  recordingStarting = true;renderUpload(); $('startRecord').disabled = true;
   let stream, context;
   try {
     stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
@@ -144,6 +189,7 @@ async function startRecording() {
 async function stopRecording() {
   if (!rec || rec.stopping) return;
   const current = rec; current.stopping = true; $('stopRecord').disabled = true; $('recordState').textContent = '마지막 녹음 저장 중';
+  $('uploadHint').textContent='마지막 녹음을 준비하고 있습니다. 이 화면을 유지해주세요.';
   try {
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('마지막 오디오 조각을 받지 못했습니다. 이전에 자동 저장한 녹음은 보존됩니다.')), 5000);
@@ -155,7 +201,7 @@ async function stopRecording() {
   } finally {
     clearInterval(current.timer); current.stream.getTracks().forEach(t => t.stop());
     current.source.disconnect(); current.node.disconnect(); await current.context.close();
-    await current.wakeLock?.release(); rec = null;
+    await current.wakeLock?.release(); rec = null;renderUpload();
     $('startRecord').disabled = false; document.body.classList.remove('recording');
     $('recordState').textContent = current.failed ? '자동 전송 대기' : '녹음 종료'; drawLive();
   }
