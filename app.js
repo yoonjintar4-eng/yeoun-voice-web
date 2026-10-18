@@ -4,6 +4,7 @@ const hosted=location.hostname.endsWith('.github.io');
 let serverBase='',serverToken='',connected=false,connecting=false,rec=null,recordingStarting=false,queueDB,syncing=false,currentJob=null;
 const memoryQueue=new Map();
 let pairing;
+let analysisSession='';
 try{serverToken=sessionStorage.getItem('voice-session')||'';}catch{}
 // A Safari/Home Screen session may block or isolate cookies and browser storage.
 const linkCode=location.pathname.match(/^\/connect\/([^/]+)(?:\/|$)/)?.[1];
@@ -19,7 +20,13 @@ async function request(path,options={}){
   finally{clearTimeout(timeout);}
 }
 async function api(path,body){const response=await request(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok){if(response.status===401)showConnection(false);const error=new Error(data.error||'처리를 완료하지 못했습니다.');error.status=response.status;throw error;}return data;}
-async function refresh(){const data=await api('/api/status');showConnection(true);if(!currentJob)$('ttsStatus').textContent=data.voice_ready?'':'몇 문장 녹음하면 목소리가 자동으로 준비됩니다.';return data;}
+function renderAnalysis(analysis){
+  const panel=$('analysisPanel');if(!panel)return;
+  if(!analysis||(analysisSession&&analysis.session!==analysisSession)){panel.hidden=true;return;}
+  panel.hidden=false;$('analysisText').textContent=analysis.text;
+  $('analysisTip').textContent=analysis.tip||'';$('analysisTip').hidden=!analysis.tip;
+}
+async function refresh(){const data=await api('/api/status');showConnection(true);renderAnalysis(data.analysis);if(!currentJob)$('ttsStatus').textContent=data.voice_ready?'':'몇 문장 녹음하면 목소리가 자동으로 준비됩니다.';return data;}
 async function connect(){
   if(connecting)return;connecting=true;
   try{
@@ -114,7 +121,7 @@ function uploadRecording(row){
     xhr.onload=()=>{
       uploadMeter.current=0;
       const ok=xhr.status>=200&&xhr.status<300;
-      if(ok){uploadMeter.confirmed+=uploadMeter.rows.get(row.id);uploadMeter.rows.set(row.id,0);}
+      if(ok){if(!rec)analysisSession=row.session;uploadMeter.confirmed+=uploadMeter.rows.get(row.id);uploadMeter.rows.set(row.id,0);}
       else uploadMeter.state='waiting';
       renderUpload();resolve({ok,status:xhr.status});
     };
@@ -161,7 +168,7 @@ async function startRecording() {
     analyser.fftSize = 256;
     const session = crypto.randomUUID(), started = Date.now();
     rec = {context, source, node, analyser, stream, session, started, saving:Promise.resolve(), stopping:false, saved:0, failed:false};
-    const current = rec;
+    const current = rec;analysisSession=session;$('analysisPanel').hidden=true;
     node.port.onmessage = ({data}) => {
       if (data.samples) {
         const blob=encodeWav(data.samples,context.sampleRate);
@@ -244,7 +251,7 @@ $('speak').onclick=safeAction(async()=>{
 window.addEventListener('online',()=>void connect());
 window.addEventListener('hashchange',()=>{if(location.hash.startsWith('#pair='))location.reload();});
 window.addEventListener('beforeunload',event=>{if(rec||Number($('pendingCount').textContent.match(/\d+/)?.[0])){event.preventDefault();event.returnValue='';}});
-setInterval(()=>{if(!hosted)void connect();},10000);
+setInterval(()=>{if(!hosted)void connect();},5000);
 (async()=>{
   if(hosted){
     try{
