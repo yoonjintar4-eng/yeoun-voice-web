@@ -169,6 +169,7 @@ $('speak').onclick=safeAction(async()=>{
   finally{currentJob=null;$('speak').disabled=false;}
 });
 window.addEventListener('online',()=>void connect());
+window.addEventListener('hashchange',()=>{if(location.hash.startsWith('#pair='))location.reload();});
 window.addEventListener('beforeunload',event=>{if(rec||Number($('pendingCount').textContent.match(/\d+/)?.[0])){event.preventDefault();event.returnValue='';}});
 setInterval(()=>{if(!hosted)void connect();},10000);
 (async()=>{
