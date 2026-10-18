@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="ko">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#f7f7f2"><title>녹음 · TTS</title><link rel="stylesheet" href="./style.css?v=auto4"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#f7f7f2"><title>녹음 · TTS</title><link rel="stylesheet" href="./style.css?v=auto5"></head>
 <body>
 <main>
   <section class="recorder" aria-label="음성 녹음">
@@ -13,6 +13,9 @@
       <progress id="uploadProgress" max="100" value="0" aria-label="맥북 전송 진행률"></progress>
       <p id="uploadHint" class="small" aria-live="polite">전송이 끝날 때까지 이 화면을 유지해주세요.</p>
     </div>
+    <div id="analysisPanel" class="analysis-panel" aria-live="polite" hidden>
+      <p id="analysisText"></p><p id="analysisTip" class="small" hidden></p>
+    </div>
     <p id="pendingCount" class="small" aria-live="polite"></p>
   </section>
   <section class="tts" aria-label="TTS 재생">
@@ -23,5 +26,5 @@
   </section>
 </main>
 <div id="notice" role="status" aria-live="polite" hidden></div>
-<script src="./app.js?v=auto4" defer></script>
+<script src="./app.js?v=auto5" defer></script>
 </body></html>
