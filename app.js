@@ -1,98 +1,27 @@
 'use strict';
-const $ = id => document.getElementById(id);
-const hosted = location.hostname.endsWith('.github.io');
-let serverBase = hosted ? (localStorage.getItem('voice-server') || 'http://127.0.0.1:8840') : '';
-let serverToken = hosted ? (sessionStorage.getItem('voice-token') || '') : '';
-const audioURLs = new Set();
-const emotions = {neutral:'일상', happy:'기쁨', question:'의문', surprise:'감탄', calm:'차분함', sad:'슬픔', firm:'단호함'};
-let appState = null, connected = false, rec = null, recordingStarting = false, audioBuffer = null, sourceUrl = null;
-let queueDB, syncing = false, selectedRecording = '', selectionToken = 0, previewTimer, currentJob, trainingJob;
-const practice = ['딱딱한 땅콩 껍질을 꼭꼭 눌렀다.', '정말? 벌써 봄이 왔다고?', '우와! 이렇게 아름다울 수가 있어!', '빨간 꽃과 파란 꽃이 나란히 피었어요.', '괜찮아. 오늘은 천천히 쉬어도 돼.', '밖에 있는 책을 읽고 같이 걸을까?', '쌀쌀한 새벽, 짧은 꿈을 꿨어요.'];
-let practiceIndex = 0;
-function notice(message, persistent = false) {
-  $('notice').textContent = message; $('notice').hidden = false;
-  clearTimeout(notice.timeout);
-  if (!persistent) notice.timeout = setTimeout(() => $('notice').hidden = true, 6500);
+const $=id=>document.getElementById(id);
+const hosted=location.hostname.endsWith('.github.io');
+let serverBase='',serverToken='',connected=false,connecting=false,rec=null,recordingStarting=false,queueDB,syncing=false,currentJob=null;
+let pairing;
+try { const value=new URLSearchParams(location.hash.slice(1)).get('pair'); if(value) pairing=JSON.parse(value); } catch {}
+function notice(message,persistent=false){$('notice').textContent=message;$('notice').hidden=false;clearTimeout(notice.timeout);if(!persistent)notice.timeout=setTimeout(()=>$('notice').hidden=true,6000);}
+function safeAction(fn){return async event=>{try{await fn(event);}catch(e){notice(e.message);}};}
+function showConnection(on){connected=on;$('connectionDot').classList.toggle('on',on);$('connectionText').textContent=on?'맥북에 연결됨':'맥북 연결 대기';}
+async function request(path,options={}){
+  const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),15000);
+  try{return await fetch(serverBase+path,{credentials:'same-origin',...options,signal:controller.signal,headers:{...options.headers,...(serverToken?{'Authorization':'Bearer '+serverToken}:{})}});}
+  catch{showConnection(false);throw new Error('맥북 연결을 기다리고 있습니다. 녹음은 이 기기에 보관됩니다.');}
+  finally{clearTimeout(timeout);}
 }
-function safeAction(fn) { return async event => { try { await fn(event); } catch (error) { notice(error.message); } }; }
-async function api(path, body, options = {}) {
-  const response = await request(path, {...options,
-    ...(body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json', ...options.headers}, body:JSON.stringify(body)})});
-  const data = await response.json();
-  if (!response.ok) {
-    if (response.status === 401) { connected = false; showConnection(false); $('settingsPanel').hidden = false; }
-    throw new Error(data.error || '요청을 처리하지 못했습니다.');
-  }
-  return data;
-}
-async function request(path, options = {}) {
-  try {
-    return await fetch(serverBase + path, {credentials:'same-origin', ...options,
-      headers:{...options.headers, ...(serverToken ? {'Authorization':'Bearer '+serverToken} : {})}});
-  } catch {
-    showConnection(false);
-    throw new Error('맥북 서버에 연결하지 못했습니다. 서버 실행 상태와 주소를 확인하고, 브라우저의 로컬 네트워크 접근을 허용해주세요.');
-  }
-}
-async function audioURL(path, track = false) {
-  if (!hosted) return path;
-  const response = await request(path);
-  if (!response.ok) throw new Error('음성을 불러오지 못했습니다. 연결 코드를 다시 입력해주세요.');
-  const url = URL.createObjectURL(await response.blob()); if (track) audioURLs.add(url); return url;
-}
-function showConnection(on) { $('connectionDot').classList.toggle('on', on); $('connectionText').textContent = on ? '맥북에 연결됨' : '맥북 연결 필요'; }
-function formatSeconds(value) { return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`; }
-function dateLabel(value) { return new Date(value * 1000).toLocaleString('ko-KR', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}); }
-async function refresh() {
-  appState = await api('/api/state'); connected = true; showConnection(true);
-  $('dataPath').textContent = appState.data_dir;
-  const minutes = appState.recordings.reduce((sum, r) => sum + r.duration, 0) / 60;
-  const approved = appState.clips.filter(c => c.approved);
-  $('totalDuration').replaceChildren(document.createTextNode(minutes.toFixed(1)), Object.assign(document.createElement('span'), {textContent:'분'}));
-  $('clipCount').replaceChildren(document.createTextNode(String(approved.length)), Object.assign(document.createElement('span'), {textContent:'개'}));
-  $('emotionCount').replaceChildren(document.createTextNode(String(new Set(approved.map(c => c.emotion)).size)), Object.assign(document.createElement('span'), {textContent:'/ 7'}));
-  $('voiceStatus').textContent = appState.reference ? '참조 목소리 준비됨' : appState.recordings.length ? '목소리를 모으는 중' : '첫 녹음 기다리는 중';
-  const select = $('recordingSelect'), previous = select.value;
-  select.replaceChildren(new Option(appState.recordings.length ? '편집할 녹음을 골라주세요' : '아직 녹음이 없어요', ''));
-  for (const r of appState.recordings) select.add(new Option(`${dateLabel(r.created)} · ${formatSeconds(r.duration)}`, r.id));
-  if (appState.recordings.some(r => r.id === previous)) select.value = previous;
-  renderClips();
-  $('profileSelect').replaceChildren(new Option('기본 모델 · 참조 음성 복제', ''));
-  for (const p of appState.profiles) $('profileSelect').add(new Option(`${dateLabel(p.created)} · ${p.samples}개 · ${p.steps}스텝 · 청취 검증 필요`, p.id));
-  $('profileSelect').value = appState.active_profile;
-  if (!trainingJob) {
-    $('trainingStatus').textContent = appState.training_ready ? `학습 엔진 준비됨 · 완료 모델 ${appState.profiles.length}개` : 'scripts/setup-training.sh로 추가 학습 엔진을 설치해주세요.';
-    const running = appState.active_jobs.find(j => j.kind === 'train');
-    if (running) void watchTraining(running.id);
-  }
-  if (!currentJob) $('ttsStatus').textContent = !appState.engine_ready ? '음성 엔진 설치가 필요합니다. scripts/setup-tts.sh를 실행하세요.' : appState.reference ? '로컬 엔진 준비 · 처음 생성할 때 모델을 다운로드하므로 시간이 걸립니다.' : '검수한 학습 구간을 참조 목소리로 먼저 지정해주세요.';
-}
-function renderClips() {
-  const list = $('clipList');
-  if (!appState.clips.length) return;
-  for (const url of audioURLs) URL.revokeObjectURL(url);
-  audioURLs.clear();
-  list.replaceChildren();
-  for (const c of appState.clips) {
-    const item = document.createElement('article'); item.className = 'clip-item';
-    const content = document.createElement('div');
-    const text = document.createElement('p'); text.textContent = c.text || '대본 없는 보관 구간';
-    const meta = document.createElement('span'); meta.className = 'small';
-    const quality = c.peak > .98 ? ' · 소리 포화 주의' : c.rms < .008 ? ' · 음량이 작아요' : '';
-    meta.textContent = `${emotions[c.emotion]} · ${(c.end-c.start).toFixed(1)}초 · ${c.approved ? '검수 완료' : '보관용'} · ${c.split === 'train' ? '학습용' : '평가용'}${c.tags ? ' · '+c.tags : ''}${quality}`;
-    const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'none';
-    if (hosted) {
-      audio.hidden = true;
-      const load = document.createElement('button'); load.className = 'text-button'; load.textContent = '▷ 음성 듣기';
-      load.onclick = safeAction(async () => { audio.src = await audioURL(`/audio/clips/${c.id}.wav`, true); audio.hidden = false; load.hidden = true; await audio.play(); });
-      content.append(text, meta, load, audio);
-    } else { audio.src = `/audio/clips/${c.id}.wav`; content.append(text, meta, audio); }
-    const actions = document.createElement('div'); actions.className = 'clip-actions';
-    const button = document.createElement('button'); button.textContent = c.id === appState.reference ? '✓ 참조 목소리' : '참조로 지정';
-    button.classList.toggle('selected', c.id === appState.reference); button.disabled = !c.approved || c.split !== 'train';
-    button.addEventListener('click', safeAction(async () => { await api('/api/reference', {id:c.id}); await refresh(); notice('참조 목소리를 지정했습니다.'); }));
-    actions.append(button); item.append(content, actions); list.append(item);
-  }
+async function api(path,body){const response=await request(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok){if(response.status===401)showConnection(false);const error=new Error(data.error||'처리를 완료하지 못했습니다.');error.status=response.status;throw error;}return data;}
+async function refresh(){const data=await api('/api/status');showConnection(true);if(!currentJob)$('ttsStatus').textContent=data.voice_ready?'':'몇 문장 녹음하면 목소리가 자동으로 준비됩니다.';return data;}
+async function connect(){
+  if(connecting)return;connecting=true;
+  try{
+    if(pairing?.code){await api('/api/login',{code:pairing.code});pairing=null;history.replaceState(null,'',location.pathname+location.search);}
+    await refresh();await syncQueue();
+  }catch(e){$('connectionText').textContent=e.status===401?'개인 연결 링크로 열어주세요.':'맥북 연결 대기';}
+  finally{connecting=false;}
 }
 function openQueue() {
   return new Promise((resolve, reject) => {
@@ -109,7 +38,7 @@ function queueTransaction(mode, action) {
 }
 async function pendingCount() {
   const count = await queueTransaction('readonly', store => store.count());
-  $('pendingCount').textContent = count ? `기기에 업로드 대기 ${count}개` : '모든 녹음 저장됨';
+  $('pendingCount').textContent = count ? `기기에 업로드 대기 ${count}개` : '';
   return count;
 }
 function encodeWav(samples, rate) {
@@ -203,7 +132,7 @@ async function stopRecording() {
     $('startRecord').disabled = false; document.body.classList.remove('recording');
     $('recordState').textContent = current.failed ? '저장 오류 · 복구 파일 확인' : '녹음 종료'; drawLive();
   }
-  await syncQueue(); notice('녹음을 종료했습니다. 아래에서 필요한 구간을 골라주세요.');
+  await syncQueue(); notice('녹음을 저장했습니다.');
 }
 function canvasSetup(canvas) {
   const ratio = window.devicePixelRatio || 1, width = canvas.clientWidth, height = canvas.clientHeight;
@@ -219,144 +148,43 @@ function drawLive() {
   data.forEach((value, i) => { const x = i / (data.length-1) * width, y = height / 2 + (value-128) / 128 * height / 2; i ? context.lineTo(x,y) : context.moveTo(x,y); }); context.stroke();
   if (rec) requestAnimationFrame(drawLive);
 }
-async function selectRecording() {
-  const token = ++selectionToken; selectedRecording = $('recordingSelect').value; audioBuffer = null;
-  $('saveClip').disabled = true; $('previewClip').disabled = true; $('sourceAudio').hidden = true;
-  clearTimeout(previewTimer); $('sourceAudio').pause();
-  if (sourceUrl) { URL.revokeObjectURL(sourceUrl); sourceUrl = null; }
-  drawEditor(); if (!selectedRecording) return;
-  const response = await request(`/audio/recordings/${selectedRecording}.wav`);
-  if (!response.ok) throw new Error('녹음 파일을 불러오지 못했습니다.');
-  const blob = await response.blob(), ctx = new AudioContext();
-  let decoded;
-  try { decoded = await ctx.decodeAudioData(await blob.arrayBuffer()); } finally { await ctx.close(); }
-  if (token !== selectionToken) return;
-  audioBuffer = decoded; sourceUrl = URL.createObjectURL(blob); $('sourceAudio').src = sourceUrl; $('sourceAudio').hidden = false;
-  $('clipStart').value = 0; $('clipEnd').value = Math.min(10, audioBuffer.duration).toFixed(2);
-  $('clipEnd').max = $('clipStart').max = audioBuffer.duration;
-  $('saveClip').disabled = false; $('previewClip').disabled = false; drawEditor();
-}
-function drawEditor() {
-  const {context, width, height} = canvasSetup($('editWave'));
-  $('waveEmpty').style.display = audioBuffer ? 'none' : '';
-  if (!audioBuffer) return;
-  const samples = audioBuffer.getChannelData(0), step = Math.max(1, Math.floor(samples.length / width));
-  context.fillStyle = '#dce8cf';
-  const startX = Number($('clipStart').value) / audioBuffer.duration * width, endX = Number($('clipEnd').value) / audioBuffer.duration * width;
-  context.fillRect(startX,0,endX-startX,height); context.strokeStyle = '#8ba772'; context.lineWidth = 1;
-  context.beginPath();
-  for (let x = 0; x < width; x += 2) {
-    let peak = 0; for (let j = x * step; j < Math.min((x+2)*step,samples.length); j++) peak = Math.max(peak, Math.abs(samples[j]));
-    const h = Math.max(1, peak * height * .9); context.moveTo(x,(height-h)/2); context.lineTo(x,(height+h)/2);
-  }
-  context.stroke(); context.fillStyle = '#6e8b57'; context.fillRect(startX,0,2,height); context.fillRect(endX-2,0,2,height);
-}
-let dragStart;
-$('editWave').addEventListener('pointerdown', event => {
-  if (!audioBuffer) return;
-  const box = event.currentTarget.getBoundingClientRect(); dragStart = Math.max(0,Math.min(audioBuffer.duration,(event.clientX-box.left)/box.width*audioBuffer.duration));
-  event.currentTarget.setPointerCapture(event.pointerId);
-});
-$('editWave').addEventListener('pointermove', event => {
-  if (dragStart === undefined || !audioBuffer) return;
-  const box = event.currentTarget.getBoundingClientRect(), position = Math.max(0,Math.min(audioBuffer.duration,(event.clientX-box.left)/box.width*audioBuffer.duration));
-  $('clipStart').value = Math.min(dragStart,position).toFixed(2); $('clipEnd').value = Math.max(dragStart,position).toFixed(2); drawEditor();
-});
-for (const name of ['pointerup','pointercancel']) $('editWave').addEventListener(name, () => { dragStart = undefined; });
-for (const id of ['clipStart','clipEnd']) $(id).addEventListener('input', drawEditor);
-$('settingsToggle').onclick = () => $('settingsPanel').hidden = !$('settingsPanel').hidden;
-$('loginForm').addEventListener('submit', safeAction(async event => {
-  event.preventDefault();
-  if (hosted) {
-    connected = false;
-    const address = new URL($('serverAddress').value);
-    if (address.username || address.password || address.search || address.hash || !['http:', 'https:'].includes(address.protocol)) throw new Error('인증정보 없이 http:// 또는 https:// 서버 주소를 입력해주세요.');
-    if (address.protocol !== 'https:' && !['localhost','127.0.0.1','[::1]'].includes(address.hostname)) throw new Error('다른 기기의 맥북 주소는 HTTPS를 사용해주세요.');
-    serverBase = address.origin; serverToken = '';
-  }
-  const code = $('connectionCode').value;
-  await api('/api/login',{code});
-  if (hosted) { serverToken = code; sessionStorage.setItem('voice-token', code); localStorage.setItem('voice-server', serverBase); }
-  $('connectionCode').value = '';
-  await refresh(); $('settingsPanel').hidden = true; await syncQueue(); notice('맥북에 연결했습니다.');
-}));
-$('startRecord').onclick = safeAction(startRecording); $('stopRecord').onclick = safeAction(stopRecording);
-$('retryUpload').onclick = safeAction(async () => { await refresh(); await syncQueue(); });
-$('refresh').onclick = safeAction(refresh); $('recordingSelect').onchange = safeAction(selectRecording);
-$('promptButton').onclick = () => { practiceIndex = (practiceIndex+1)%practice.length; $('practiceText').textContent = practice[practiceIndex]; };
-$('previewClip').onclick = safeAction(async () => {
-  const start = Number($('clipStart').value), end = Number($('clipEnd').value);
-  if (!(end > start && start >= 0 && end <= audioBuffer.duration + .01)) throw new Error('올바른 시작·종료 시간을 지정해주세요.');
-  clearTimeout(previewTimer); $('sourceAudio').currentTime = start; await $('sourceAudio').play();
-  previewTimer = setTimeout(() => $('sourceAudio').pause(), (end-start)*1000);
-});
-$('saveClip').onclick = safeAction(async () => {
-  if (!selectedRecording || !audioBuffer) return;
-  $('saveClip').disabled = true;
-  try {
-    await api('/api/clips', {recording_id:selectedRecording, start:Number($('clipStart').value), end:Number($('clipEnd').value),
-      text:$('transcript').value, emotion:$('clipEmotion').value, tags:$('clipTags').value, approved:$('approved').checked});
-    await refresh(); $('transcript').value = ''; $('approved').checked = false; notice('선택한 구간을 맥북에 저장했습니다.');
-  } finally { $('saveClip').disabled = false; }
-});
-$('exportDataset').onclick = safeAction(async () => { const result = await api('/api/export',{}); notice(`${result.message} · ${result.path}`, true); });
-async function watchTraining(id) {
-  if (trainingJob) return;
-  trainingJob = id; $('train').disabled = true; $('cancelTrain').hidden = false; $('trainingProgress').hidden = false;
-  try {
-    while (true) {
-      const job = await api('/api/jobs/'+id);
-      $('trainingStatus').textContent = job.status === 'done' ? '학습 완료. 모델을 선택하고 같은 문장으로 비교해주세요.' : '맥북에서 추가 학습 중… 학습 로그를 아래에 표시합니다.';
-      $('trainingProgress').textContent = job.progress || '모델과 음성 데이터를 준비하고 있습니다.';
-      if (job.status === 'error') throw new Error(job.error);
-      if (job.status === 'done') { await refresh(); notice('추가 학습을 마쳤습니다. 적용할 모델을 직접 선택해주세요.'); break; }
-      await new Promise(resolve => setTimeout(resolve,3000));
-    }
-  } catch (error) { $('trainingStatus').textContent = error.message; notice(error.message); }
-  finally { trainingJob = null; $('train').disabled = false; $('cancelTrain').hidden = true; }
-}
-$('train').onclick = safeAction(async () => { const result = await api('/api/train', {steps:Number($('trainingSteps').value)}); await watchTraining(result.id); });
-$('cancelTrain').onclick = safeAction(async () => { await api('/api/train/cancel',{id:trainingJob}); notice('학습 중단을 요청했습니다. 이전 모델과 원본은 보존됩니다.'); });
-$('profileSelect').onchange = safeAction(async () => { await api('/api/profile',{id:$('profileSelect').value}); await refresh(); notice('재생 모델을 변경했습니다.'); });
-$('speak').onclick = safeAction(async () => {
-  $('speak').disabled = true; $('feedbackPanel').hidden = true; $('ttsAudio').pause(); $('ttsAudio').hidden = true;
-  $('ttsStatus').textContent = '내 목소리를 생성하고 있어요. 첫 실행에는 모델 다운로드가 필요합니다.';
-  try {
-    const result = await api('/api/tts',{text:$('ttsText').value,emotion:$('ttsEmotion').value}); currentJob = result.id;
-    let failures = 0;
-    while (true) {
-      await new Promise(resolve => setTimeout(resolve,2500));
-      let job;
-      try { job = await api('/api/jobs/'+currentJob); failures = 0; }
-      catch (error) { if (++failures >= 5) throw error; $('ttsStatus').textContent = '맥북에 다시 연결하는 중… 생성 작업은 맥북에서 계속됩니다.'; continue; }
-      if (job.status === 'error') throw new Error(job.error);
-      if (job.status === 'done') {
-        if ($('ttsAudio').src.startsWith('blob:')) URL.revokeObjectURL($('ttsAudio').src);
-        $('ttsAudio').src = await audioURL(job.audio); $('ttsAudio').hidden = false; $('feedbackPanel').hidden = false;
-        $('ttsStatus').textContent = '생성이 끝났어요. 발음과 억양을 듣고 개선 메모를 남겨주세요.';
-        try { await $('ttsAudio').play(); } catch { $('ttsStatus').textContent += ' 오디오의 재생 버튼을 눌러주세요.'; }
-        break;
+$('startRecord').onclick=safeAction(startRecording);$('stopRecord').onclick=safeAction(stopRecording);
+$('speak').onclick=safeAction(async()=>{
+  const text=$('ttsText').value.trim();if(!text){$('ttsText').focus();return;}
+  $('speak').disabled=true;$('ttsAudio').pause();$('ttsAudio').hidden=true;$('ttsStatus').textContent='음성 생성 중…';
+  try{
+    const result=await api('/api/tts',{text});currentJob=result.id;
+    while(true){
+      await new Promise(resolve=>setTimeout(resolve,2000));
+      const job=await api('/api/jobs/'+currentJob);
+      if(job.status==='error')throw new Error(job.error);
+      if(job.status==='done'){
+        if($('ttsAudio').src.startsWith('blob:'))URL.revokeObjectURL($('ttsAudio').src);
+        const response=await request(job.audio);if(!response.ok)throw new Error('생성한 음성을 불러오지 못했습니다.');
+        $('ttsAudio').src=URL.createObjectURL(await response.blob());$('ttsAudio').hidden=false;$('ttsStatus').textContent='';
+        try{await $('ttsAudio').play();}catch{$('ttsStatus').textContent='아래 오디오의 재생 버튼을 눌러주세요.';}break;
       }
     }
-  } catch (error) { $('ttsStatus').textContent = error.message; throw error; }
-  finally { $('speak').disabled = false; }
+  }catch(e){$('ttsStatus').textContent=e.message;}
+  finally{currentJob=null;$('speak').disabled=false;}
 });
-$('saveFeedback').onclick = safeAction(async () => {
-  await api('/api/feedback',{job_id:currentJob,rating:Number($('rating').value),note:$('feedbackNote').value});
-  $('feedbackNote').value = ''; notice('평가를 저장했습니다. 개선 기록은 맥북 데이터베이스에 누적됩니다.');
-});
-window.addEventListener('online', () => { if (!hosted || serverToken) void refresh().then(syncQueue).catch(() => {}); });
-window.addEventListener('resize', () => { drawEditor(); if (!rec) drawLive(); });
-window.addEventListener('beforeunload', event => { if (rec || Number($('pendingCount').textContent.match(/\d+/)?.[0])) { event.preventDefault(); event.returnValue = ''; } });
-setInterval(() => { void syncQueue(); },15000);
-(async () => {
-  try { queueDB = await openQueue(); await pendingCount(); } catch { notice('브라우저 저장소를 사용할 수 없어 녹음할 수 없습니다.',true); $('startRecord').disabled = true; }
-  drawLive(); drawEditor();
-  if (hosted) {
-    $('serverAddressRow').hidden = false; $('serverAddress').value = serverBase;
-    $('settingsPanel').hidden = false;
-    $('ttsStatus').textContent = 'GitHub 배포 화면입니다. 맥북 서버 주소와 연결 코드를 입력하면 저장·학습·재생을 사용할 수 있습니다.';
-    if (!serverToken) { showConnection(false); return; }
+window.addEventListener('online',()=>void connect());
+window.addEventListener('beforeunload',event=>{if(rec||Number($('pendingCount').textContent.match(/\d+/)?.[0])){event.preventDefault();event.returnValue='';}});
+setInterval(()=>{if(!hosted)void connect();},10000);
+(async()=>{
+  if(hosted){
+    try{
+      const response=await fetch('./server-config.json',{cache:'no-store'});const config=await response.json();
+      const destination=new URL(pairing?.server||config.server);
+      if(destination.protocol!=='https:'||destination.username||destination.password)throw new Error('HTTPS required');
+      if(pairing?.code){
+        serverBase=destination.origin;serverToken=pairing.code;
+        queueDB=await openQueue();const count=await pendingCount();
+        if(count){await api('/api/login',{code:pairing.code});connected=true;await syncQueue();if(await pendingCount())return;}
+      }
+      location.replace(destination.origin+'/'+location.hash);return;
+    }catch{$('connectionText').textContent='맥북 연결 준비 중';}
   }
-  try { await refresh(); await syncQueue(); } catch (error) { notice(error.message); }
+  try{queueDB=await openQueue();await pendingCount();}catch{$('startRecord').disabled=true;notice('녹음 저장을 위해 브라우저 저장 공간을 허용해주세요.',true);}
+  drawLive();if(!hosted)await connect();
 })();
